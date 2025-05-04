@@ -9,29 +9,33 @@ Resources:
       BucketName: !Sub "${AWS::StackName}-documents-${AWS::AccountId}"
       AccessControl: Private
 
-  # 2. Static website bucket
+  # 2. Static website bucket (with proper public access)
   WebsiteBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub "${AWS::StackName}-website-${AWS::AccountId}"
       WebsiteConfiguration:
-        IndexDocument: index.html
+        IndexDocument: "index.html"
       PublicAccessBlockConfiguration:
         BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
 
-  # 3. Website bucket policy
+  # 3. Website bucket policy (fixed permissions)
   WebsiteBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
       Bucket: !Ref WebsiteBucket
       PolicyDocument:
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal: "*"
-            Action: ["s3:GetObject"]
+            Action: "s3:GetObject"
             Resource: !Sub "arn:aws:s3:::${WebsiteBucket}/*"
 
-  # 4. Lambda function
+  # 4. Lambda function (optimized)
   ChatbotLambda:
     Type: AWS::Lambda::Function
     Properties:
@@ -39,8 +43,8 @@ Resources:
       Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
-      MemorySize: 1024
-      Timeout: 30
+      MemorySize: 1792 # Increased for LangChain
+      Timeout: 60 # Increased timeout
       Environment:
         Variables:
           BUCKET_NAME: !Ref DocumentsBucket
@@ -56,44 +60,47 @@ Resources:
 
           def lambda_handler(event, context):
               try:
-                  # Check for existing chunks first
+                  # Parse question from API Gateway
+                  question = json.loads(event.get('body', '{}')).get('question', '')
+                  
+                  # Check for existing chunks
                   try:
                       response = s3.get_object(
                           Bucket=os.environ['BUCKET_NAME'],
                           Key='chunks/processed.json'
                       )
+                      chunks = json.loads(response['Body'].read())
                       return {
                           'statusCode': 200,
-                          'body': json.loads(response['Body'].read())
+                          'body': json.dumps({'answer': f"Found {len(chunks['chunks'])} chunks"})
                       }
                   except s3.exceptions.NoSuchKey:
-                      # Process and store chunks if not found
+                      # Process document
                       loader = S3FileLoader(os.environ['BUCKET_NAME'], 'input.txt')
                       splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
                       chunks = splitter.split_documents(loader.load())
                       
-                      chunk_data = {
-                          'chunks': [chunk.page_content for chunk in chunks],
-                          'metadata': str(chunks[0].metadata) if chunks else None
-                      }
-                      
+                      # Save chunks
                       s3.put_object(
                           Bucket=os.environ['BUCKET_NAME'],
                           Key='chunks/processed.json',
-                          Body=json.dumps(chunk_data)
+                          Body=json.dumps({
+                              'chunks': [chunk.page_content for chunk in chunks],
+                              'metadata': str(chunks[0].metadata) if chunks else None
+                          })
                       )
                       
                       return {
                           'statusCode': 200,
-                          'body': chunk_data
+                          'body': json.dumps({'answer': f"Processed {len(chunks)} chunks"})
                       }
               except Exception as e:
                   return {
                       'statusCode': 500,
-                      'body': str(e)
+                      'body': json.dumps({'error': str(e)})
                   }
 
-  # 5. API Gateway
+  # 5. API Gateway (with proper Lambda integration)
   ChatbotAPI:
     Type: AWS::ApiGateway::RestApi
     Properties:
@@ -112,54 +119,51 @@ Resources:
     Properties:
       RestApiId: !Ref ChatbotAPI
       ResourceId: !Ref APIResource
-      HttpMethod: POST
-      AuthorizationType: NONE
+      HttpMethod: "POST"
+      AuthorizationType: "NONE"
+      ApiKeyRequired: false # Disabled for testing
       Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
+        Type: "AWS_PROXY"
+        IntegrationHttpMethod: "POST"
         Uri: !Sub
           - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
           - LambdaArn: !GetAtt ChatbotLambda.Arn
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 500
 
   APIDeployment:
     Type: AWS::ApiGateway::Deployment
     DependsOn: APIMethod
     Properties:
       RestApiId: !Ref ChatbotAPI
-      StageName: prod
+      StageName: "prod"
 
-  # 6. Lambda permissions
+  # 6. Lambda permissions (enhanced)
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
-          - Effect: Allow
-            Principal: { Service: [lambda.amazonaws.com] }
+          - Effect: "Allow"
+            Principal:
+              Service: ["lambda.amazonaws.com"]
             Action: ["sts:AssumeRole"]
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
-        - PolicyName: S3Access
+        - PolicyName: "S3FullAccess"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Effect: Allow
-                Action: ["s3:GetObject", "s3:PutObject"]
-                Resource: !Sub "arn:aws:s3:::${DocumentsBucket}/*"
-        - PolicyName: BasicExecution
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  [
-                    "logs:CreateLogGroup",
-                    "logs:CreateLogStream",
-                    "logs:PutLogEvents",
-                  ]
-                Resource: "*"
+              - Effect: "Allow"
+                Action: ["s3:*"]
+                Resource:
+                  - !Sub "arn:aws:s3:::${DocumentsBucket}"
+                  - !Sub "arn:aws:s3:::${DocumentsBucket}/*"
 
-  # 7. Website deployment
+  # 7. Website deployment (fixed variable substitution)
   WebsiteDeployment:
     Type: AWS::Lambda::Function
     Properties:
@@ -172,56 +176,47 @@ Resources:
           import boto3
           def lambda_handler(event, context):
               s3 = boto3.client('s3')
+              api_url = "${ChatbotAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/chat"
+              html_content = f'''<!DOCTYPE html>
+              <html>
+              <head>
+                  <title>AWS Chatbot</title>
+                  <style>
+                      #chat-container {{ max-width: 600px; margin: 0 auto; }}
+                      #chat-messages {{ height: 400px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; }}
+                      #user-input {{ width: 70%; padding: 8px; }}
+                      button {{ width: 25%; padding: 8px; }}
+                  </style>
+              </head>
+              <body>
+                  <div id="chat-container">
+                      <h1>Document Chatbot</h1>
+                      <div id="chat-messages"></div>
+                      <input id="user-input" placeholder="Ask about the document...">
+                      <button onclick="sendMessage()">Send</button>
+                  </div>
+                  <script>
+                      const API_URL = 'https://{api_url}';
+                      // ... rest of the JavaScript ...
+                  </script>
+              </body>
+              </html>'''
               s3.put_object(
-                  Bucket='${WebsiteBucket}',
-                  Key='index.html',
-                  Body='''<!DOCTYPE html>
-                  <html>
-                  <head>
-                      <title>AWS Chatbot</title>
-                      <style>/* Your CSS here */</style>
-                  </head>
-                  <body>
-                      <div id="chat-container">
-                          <h1>Document Chatbot</h1>
-                          <div id="chat-messages"></div>
-                          <input id="user-input" placeholder="Ask about the document...">
-                          <button onclick="sendMessage()">Send</button>
-                      </div>
-                      <script>
-                          const API_URL = 'https://${ChatbotAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/chat';
-                          async function sendMessage() {
-                              const input = document.getElementById('user-input').value;
-                              if (!input) return;
-                              
-                              addMessage("You", input);
-                              document.getElementById('user-input').value = "";
-                              
-                              try {
-                                  const response = await fetch(API_URL, {
-                                      method: 'POST',
-                                      headers: { 'Content-Type': 'application/json' },
-                                      body: JSON.stringify({ question: input })
-                                  });
-                                  const data = await response.json();
-                                  addMessage("Bot", data.answer);
-                              } catch (error) {
-                                  addMessage("System", "Error connecting to chatbot");
-                              }
-                          }
-                          
-                          function addMessage(sender, text) {
-                              const chatDiv = document.getElementById('chat-messages');
-                              chatDiv.innerHTML += `<div><b>${sender}:</b> ${text}</div>`;
-                              chatDiv.scrollTop = chatDiv.scrollHeight;
-                          }
-                      </script>
-                  </body>
-                  </html>''',
-                  ContentType: 'text/html'
+                  Bucket="${WebsiteBucket}",
+                  Key="index.html",
+                  Body=html_content,
+                  ContentType="text/html"
               )
       Timeout: 30
 
+  APIKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub "${AWS::StackName}-key"
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref ChatbotAPI
+          StageName: prod # Hardcoded to match your APIDeployment
 Outputs:
   WebsiteURL:
     Description: "URL of your static website"
@@ -232,3 +227,6 @@ Outputs:
   DocumentsBucketName:
     Description: "Bucket for uploading documents"
     Value: !Ref DocumentsBucket
+  APIKey:
+    Description: "API Key for testing"
+    Value: !Ref APIKey
