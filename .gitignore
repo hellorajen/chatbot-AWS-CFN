@@ -1,0 +1,3 @@
+# CloudFormation generated files
+*.template
+packaged-template.yml
